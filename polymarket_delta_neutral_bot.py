@@ -57,6 +57,8 @@ MIDPOINT_MOVE_THRESHOLD = 0.03  # 3-cent midpoint jump triggers emergency cancel
 CIRCUIT_BREAKER_COOLDOWN = 120  # Seconds to pause after circuit breaker fires
 # 4) WebSocket orderbook monitoring interval
 WS_MONITOR_INTERVAL = 2        # Seconds between orderbook safety checks
+# 5) Smart refresh: skip cancel/replace if midpoint barely moved
+MIDPOINT_SKIP_THRESHOLD = 0.005  # Skip refresh if midpoint moved < 0.5 cent
 
 # ---- Inventory Drift Protection ----
 DRIFT_THRESHOLD_PCT = 0.10     # 10% delta imbalance triggers rebalance
@@ -97,6 +99,9 @@ class State:
     # Inventory drift tracking
     paused_markets: set = set()    # markets paused due to excessive drift
     total_capital: float = 0.0     # total USDC allocated across all markets
+    # Smart refresh: last midpoint we placed orders at
+    last_order_midpoint: dict = {}  # market_id -> float
+    skipped_refreshes: int = 0      # counter for stats
 
 
 state = State()
@@ -376,6 +381,7 @@ def cancel_market_orders(condition_id: str):
     except Exception as e:
         print(f"  [Orders] Cancel failed: {e}")
     state.active_orders[condition_id] = []
+    state.last_order_midpoint.pop(condition_id, None)
 
 
 def get_current_midpoint(condition_id: str) -> float:
@@ -622,6 +628,16 @@ def place_two_sided_orders(condition_id: str):
         print(f"  [Orders] Midpoint {midpoint:.2f} out of range [{MIN_MIDPOINT}, {MAX_MIDPOINT}], skipping")
         return
 
+    # Smart refresh: skip cancel/replace if midpoint barely moved
+    last_mid = state.last_order_midpoint.get(condition_id)
+    has_orders = bool(state.active_orders.get(condition_id))
+    if last_mid is not None and has_orders:
+        mid_move = abs(midpoint - last_mid)
+        if mid_move < MIDPOINT_SKIP_THRESHOLD:
+            state.skipped_refreshes += 1
+            print(f"    [Skip] midpoint moved {mid_move:.4f} < {MIDPOINT_SKIP_THRESHOLD} -- keeping existing orders")
+            return
+
     # Cancel existing orders first
     cancel_market_orders(condition_id)
 
@@ -667,6 +683,7 @@ def place_two_sided_orders(condition_id: str):
             print(f"    [SKIP] NO sell: depth ahead = {no_depth:.0f} < {MIN_DEPTH_AHEAD:.0f} (not safe)")
 
     state.active_orders[condition_id] = order_ids
+    state.last_order_midpoint[condition_id] = midpoint
 
     print(
         f"  [LP] Yes SELL {yes_size:.0f}@{yes_sell_price:.2f} (depth:{yes_depth:.0f}) | "
@@ -1049,7 +1066,7 @@ def main():
             for condition_id in state.market_info:
                 cancel_market_orders(condition_id)
             print_reward_estimate()
-            print(f"Total cycles: {state.cycle_count}")
+            print(f"Total cycles: {state.cycle_count} | Skipped refreshes: {state.skipped_refreshes}")
             break
         except Exception as e:
             print(f"[Error] {e}")
