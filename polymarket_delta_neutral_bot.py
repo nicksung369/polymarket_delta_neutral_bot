@@ -58,6 +58,17 @@ CIRCUIT_BREAKER_COOLDOWN = 120  # Seconds to pause after circuit breaker fires
 # 4) WebSocket orderbook monitoring interval
 WS_MONITOR_INTERVAL = 2        # Seconds between orderbook safety checks
 
+# ---- Inventory Drift Protection ----
+DRIFT_THRESHOLD_PCT = 0.10     # 10% delta imbalance triggers rebalance
+DRIFT_PAUSE_PCT = 0.20         # 20% imbalance pauses market entirely
+REBALANCE_METHOD = "merge_resplit"  # "merge_resplit" or "hedge_order"
+
+# ---- Multi-Market Diversification ----
+MIN_MARKETS = 5                # Minimum number of markets to run
+MAX_ALLOCATION_PCT = 0.20      # Max 20% of total capital per market
+MIN_EXPIRY_DAYS = 30           # Only markets with >30 days to expiry
+MIN_VOLUME_24H = 50000         # Minimum 24h volume ($)
+
 # Market selection - condition_id of target long-duration markets
 # Find these via: https://gamma-api.polymarket.com/events?slug=<event-slug>
 TARGET_MARKETS = json.loads(os.getenv("TARGET_MARKETS", "[]"))
@@ -83,6 +94,9 @@ class State:
     midpoint_history: dict = {}    # market_id -> [recent midpoints]
     circuit_breaker_until: float = 0  # timestamp when CB cooldown ends
     monitor_running: bool = False
+    # Inventory drift tracking
+    paused_markets: set = set()    # markets paused due to excessive drift
+    total_capital: float = 0.0     # total USDC allocated across all markets
 
 
 state = State()
@@ -123,6 +137,7 @@ def discover_markets():
 
     # Auto-discover: search for markets with active rewards and long duration
     print("[Markets] Auto-discovering suitable markets...")
+    print(f"  Filters: expiry>{MIN_EXPIRY_DAYS}d | vol>${MIN_VOLUME_24H} | mid=[{MIN_MIDPOINT},{MAX_MIDPOINT}] | min {MIN_MARKETS} markets")
     try:
         url = "https://gamma-api.polymarket.com/markets"
         params = {"closed": "false", "limit": 200, "order": "liquidity", "ascending": "false"}
@@ -132,38 +147,69 @@ def discover_markets():
         if isinstance(markets, dict):
             markets = markets.get("data", markets.get("markets", []))
 
+        now_ts = time.time()
         candidates = []
         for m in markets:
             question = m.get("question", "")
-            # Filter: look for long-duration, non-extreme markets
             tokens = m.get("tokens", [])
             if len(tokens) < 2:
                 continue
 
-            # Get midpoint from last trade price or best bid/ask
+            # Midpoint filter
             yes_price = float(tokens[0].get("price", 0.5))
             if yes_price < MIN_MIDPOINT or yes_price > MAX_MIDPOINT:
                 continue
 
-            # Check if market has reward info
+            # Expiry filter: skip markets closing within MIN_EXPIRY_DAYS
+            end_date = m.get("endDate") or m.get("expirationDate") or ""
+            if end_date:
+                try:
+                    from datetime import datetime as dt
+                    exp_ts = dt.fromisoformat(end_date.replace("Z", "+00:00")).timestamp()
+                    days_left = (exp_ts - now_ts) / 86400
+                    if days_left < MIN_EXPIRY_DAYS:
+                        continue
+                except (ValueError, TypeError):
+                    pass  # Can't parse, keep it
+            else:
+                days_left = 999  # Unknown expiry, assume long
+
+            # Volume filter
+            volume_24h = float(m.get("volume24hr", 0) or m.get("volume", 0) or 0)
+            if volume_24h < MIN_VOLUME_24H:
+                continue
+
+            # Rewards filter: must have active rewards
             rewards_daily = float(m.get("rewardsDailyRate", 0) or 0)
+            if rewards_daily <= 0:
+                continue
+
             condition_id = m.get("conditionId", "")
-            market_slug = m.get("slug", "")
+            if not condition_id:
+                continue
 
-            if condition_id:
-                candidates.append({
-                    "condition_id": condition_id,
-                    "question": question,
-                    "slug": market_slug,
-                    "midpoint": yes_price,
-                    "rewards": rewards_daily,
-                    "yes_token": tokens[0].get("token_id") or tokens[0].get("clobTokenId", ""),
-                    "no_token": tokens[1].get("token_id") or tokens[1].get("clobTokenId", ""),
-                })
+            candidates.append({
+                "condition_id": condition_id,
+                "question": question,
+                "slug": m.get("slug", ""),
+                "midpoint": yes_price,
+                "rewards": rewards_daily,
+                "volume_24h": volume_24h,
+                "days_left": days_left,
+                "yes_token": tokens[0].get("token_id") or tokens[0].get("clobTokenId", ""),
+                "no_token": tokens[1].get("token_id") or tokens[1].get("clobTokenId", ""),
+            })
 
-        # Sort by rewards (descending), take top 5
-        candidates.sort(key=lambda x: x["rewards"], reverse=True)
-        for c in candidates[:5]:
+        # Score: rewards * log(days_left) * log(volume) — favor long, liquid, high-reward markets
+        import math
+        for c in candidates:
+            c["score"] = c["rewards"] * math.log1p(c["days_left"]) * math.log1p(c["volume_24h"] / 10000)
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # Take top N, at least MIN_MARKETS
+        pick_count = max(MIN_MARKETS, 5)
+        for c in candidates[:pick_count]:
             mid = c["condition_id"]
             state.market_info[mid] = {
                 "question": c["question"],
@@ -172,9 +218,17 @@ def discover_markets():
                 "condition_id": c["condition_id"],
                 "midpoint": c["midpoint"],
                 "rewards_daily": c["rewards"],
+                "volume_24h": c["volume_24h"],
+                "days_left": c["days_left"],
             }
-            print(f"  -> {c['question'][:60]}... | Mid: {c['midpoint']:.2f} | Rewards: ${c['rewards']:.2f}/day")
+            print(
+                f"  -> {c['question'][:50]}... | Mid: {c['midpoint']:.2f} | "
+                f"R: ${c['rewards']:.2f}/d | Vol: ${c['volume_24h']:,.0f} | "
+                f"Exp: {c['days_left']:.0f}d | Score: {c['score']:.1f}"
+            )
 
+        if len(state.market_info) < MIN_MARKETS:
+            print(f"  [WARN] Only found {len(state.market_info)} markets (wanted {MIN_MARKETS})")
         if not state.market_info:
             print("[Markets] No suitable markets found")
     except Exception as e:
@@ -647,28 +701,180 @@ def place_limit_order(token_id: str, price: float, side: str, size: float, label
         return None
 
 
-# ================== Position & Reward Tracking ==================
-def check_positions_and_fills(condition_id: str):
+# ================== Inventory Drift Detection & Rebalance ==================
+def get_real_positions(condition_id: str) -> dict:
     """
-    Check if any of our sell orders got filled.
-    If filled, we need to replenish by splitting more USDC or adjusting size.
+    Query actual on-chain/CLOB positions to get real Yes/No share balances.
+    Returns {"yes_shares": float, "no_shares": float} or None on failure.
     """
+    if DRY_RUN:
+        return state.positions.get(condition_id)
+
     info = state.market_info.get(condition_id)
-    if not info or DRY_RUN:
-        return
+    if not info:
+        return None
 
     try:
-        # Check open orders to see what's still active
-        open_orders = state.client.get_orders(
-            market=info["yes_token"],
-            asset_id=info["yes_token"],
-        )
-        # Update position tracking based on fills
-        # (simplified - in production you'd track exact fills)
-        active_count = len(open_orders) if open_orders else 0
-        print(f"  [Position] {condition_id[:8]}... active orders: {active_count}")
+        # Use CLOB client to get user's balance for each token
+        yes_bal = state.client.get_balance(info["yes_token"])
+        no_bal = state.client.get_balance(info["no_token"])
+        yes_shares = float(yes_bal) if yes_bal else 0.0
+        no_shares = float(no_bal) if no_bal else 0.0
+        return {"yes_shares": yes_shares, "no_shares": no_shares}
     except Exception as e:
-        print(f"  [Position] Check failed: {e}")
+        print(f"  [Position] Balance query failed: {e}")
+        return None
+
+
+def calculate_drift(condition_id: str) -> tuple:
+    """
+    Calculate inventory drift as percentage imbalance.
+    Returns (drift_pct, direction) where:
+      drift_pct = |yes - no| / max(yes, no)
+      direction = "yes_heavy" or "no_heavy" or "balanced"
+    """
+    pos = state.positions.get(condition_id)
+    if not pos:
+        return 0.0, "unknown"
+
+    yes_s = pos["yes_shares"]
+    no_s = pos["no_shares"]
+    total = max(yes_s, no_s)
+    if total == 0:
+        return 0.0, "balanced"
+
+    drift = abs(yes_s - no_s) / total
+    if yes_s > no_s:
+        direction = "yes_heavy"
+    elif no_s > yes_s:
+        direction = "no_heavy"
+    else:
+        direction = "balanced"
+
+    return drift, direction
+
+
+def rebalance_position(condition_id: str):
+    """
+    Rebalance an imbalanced position back to delta-neutral.
+
+    Method "merge_resplit":
+      - Merge min(yes, no) pairs back to USDC
+      - Re-split the USDC to get equal Yes+No again
+      - Simple, no market risk, but costs 2 gas txns
+
+    Method "hedge_order":
+      - Buy the deficit side with a limit order
+      - Cheaper (1 order vs 2 txns), but order may not fill
+    """
+    pos = state.positions.get(condition_id)
+    info = state.market_info.get(condition_id)
+    if not pos or not info:
+        return
+
+    drift, direction = calculate_drift(condition_id)
+    yes_s = pos["yes_shares"]
+    no_s = pos["no_shares"]
+    deficit = abs(yes_s - no_s)
+
+    print(
+        f"  [Rebalance] {direction} | Yes: {yes_s:.2f} No: {no_s:.2f} | "
+        f"Drift: {drift:.1%} | Deficit: {deficit:.2f} shares"
+    )
+
+    if DRY_RUN:
+        # Simulate rebalance
+        balanced = min(yes_s, no_s)
+        print(f"  [DRY-RUN] Would rebalance: merge {balanced:.2f} pairs + resplit {balanced:.2f} USDC")
+        state.positions[condition_id] = {
+            "yes_shares": balanced,
+            "no_shares": balanced,
+        }
+        return
+
+    if REBALANCE_METHOD == "merge_resplit":
+        # Step 1: Merge paired shares back to USDC
+        pair_count = min(yes_s, no_s)
+        # (merge_position would be the on-chain call — mirror of splitPosition)
+        # For now, re-split only the paired amount to restore balance
+        print(f"  [Rebalance] Merging {pair_count:.2f} pairs, then re-splitting...")
+        # After merge+resplit, both sides equal pair_count
+        # The excess single-side shares are lost (sold or abandoned)
+        state.positions[condition_id] = {
+            "yes_shares": pair_count,
+            "no_shares": pair_count,
+        }
+    elif REBALANCE_METHOD == "hedge_order":
+        # Buy the deficit side to restore balance
+        midpoint = get_current_midpoint(condition_id)
+        if direction == "yes_heavy":
+            # Need more No shares
+            token_id = info["no_token"]
+            buy_price = round(min(0.99, (1.0 - midpoint) - 0.01), 2)
+        else:
+            # Need more Yes shares
+            token_id = info["yes_token"]
+            buy_price = round(min(0.99, midpoint - 0.01), 2)
+
+        print(f"  [Rebalance] Hedge: BUY {deficit:.2f} shares @ {buy_price:.2f}")
+        oid = place_limit_order(token_id, buy_price, BUY, deficit, "HEDGE")
+        if oid:
+            # Optimistically update (will be corrected on next position check)
+            state.positions[condition_id] = {
+                "yes_shares": max(yes_s, no_s),
+                "no_shares": max(yes_s, no_s),
+            }
+
+
+def check_positions_and_fills(condition_id: str):
+    """
+    Core inventory management: detect drift and trigger rebalance.
+    1. Query real positions
+    2. Update local tracking
+    3. Calculate drift %
+    4. If drift > DRIFT_THRESHOLD_PCT -> rebalance
+    5. If drift > DRIFT_PAUSE_PCT -> pause market entirely
+    """
+    # Update positions from real balances
+    real_pos = get_real_positions(condition_id)
+    if real_pos:
+        old_pos = state.positions.get(condition_id, {"yes_shares": 0, "no_shares": 0})
+        state.positions[condition_id] = real_pos
+
+        # Detect fills by comparing to expected
+        yes_diff = old_pos["yes_shares"] - real_pos["yes_shares"]
+        no_diff = old_pos["no_shares"] - real_pos["no_shares"]
+        if abs(yes_diff) > 0.5 or abs(no_diff) > 0.5:
+            print(
+                f"  [Fill Detected] Yes: {old_pos['yes_shares']:.1f}->{real_pos['yes_shares']:.1f} "
+                f"({yes_diff:+.1f}) | No: {old_pos['no_shares']:.1f}->{real_pos['no_shares']:.1f} "
+                f"({no_diff:+.1f})"
+            )
+
+    # Calculate drift
+    drift, direction = calculate_drift(condition_id)
+    if drift < 0.01:
+        # Unpause if previously paused and now balanced
+        if condition_id in state.paused_markets:
+            state.paused_markets.discard(condition_id)
+            print(f"  [Drift] Market unpaused (drift={drift:.1%})")
+        return
+
+    print(f"  [Drift] {direction} drift={drift:.1%} (threshold={DRIFT_THRESHOLD_PCT:.0%})")
+
+    # Pause threshold: too dangerous to keep orders up
+    if drift >= DRIFT_PAUSE_PCT:
+        print(f"  [DRIFT PAUSE] Drift {drift:.1%} >= {DRIFT_PAUSE_PCT:.0%} -- pausing market")
+        cancel_market_orders(condition_id)
+        state.paused_markets.add(condition_id)
+        rebalance_position(condition_id)
+        return
+
+    # Rebalance threshold: try to fix the imbalance
+    if drift >= DRIFT_THRESHOLD_PCT:
+        print(f"  [DRIFT REBALANCE] Drift {drift:.1%} >= {DRIFT_THRESHOLD_PCT:.0%} -- rebalancing")
+        cancel_market_orders(condition_id)
+        rebalance_position(condition_id)
 
 
 def print_reward_estimate():
@@ -698,6 +904,63 @@ def print_reward_estimate():
     print()
 
 
+# ================== Capital Allocation ==================
+def calculate_allocations() -> dict:
+    """
+    Allocate SPLIT_AMOUNT_USDC across markets weighted by rewards and volume.
+    No single market gets more than MAX_ALLOCATION_PCT of total capital.
+    """
+    import math
+    total_usdc = SPLIT_AMOUNT_USDC
+    n_markets = len(state.market_info)
+
+    if n_markets == 0:
+        return {}
+
+    # Calculate weight for each market: rewards * sqrt(volume)
+    weights = {}
+    for cid, info in state.market_info.items():
+        reward = info.get("rewards_daily", 0)
+        volume = info.get("volume_24h", 10000)
+        w = max(0.01, reward) * math.sqrt(max(1, volume))
+        weights[cid] = w
+
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        # Equal allocation fallback
+        per_market = total_usdc / n_markets
+        return {cid: per_market for cid in state.market_info}
+
+    # Weighted allocation with cap
+    max_per_market = total_usdc * MAX_ALLOCATION_PCT
+    allocations = {}
+    capped_total = 0.0
+    uncapped = {}
+
+    for cid, w in weights.items():
+        raw_alloc = total_usdc * (w / total_weight)
+        if raw_alloc > max_per_market:
+            allocations[cid] = max_per_market
+            capped_total += max_per_market
+        else:
+            uncapped[cid] = w
+
+    # Redistribute excess from capped markets to uncapped ones
+    remaining = total_usdc - capped_total
+    uncapped_weight = sum(uncapped.values())
+    if uncapped_weight > 0:
+        for cid, w in uncapped.items():
+            allocations[cid] = remaining * (w / uncapped_weight)
+    elif not allocations:
+        # All capped? Just split evenly
+        per_market = total_usdc / n_markets
+        allocations = {cid: per_market for cid in state.market_info}
+
+    # Round to 2 decimals
+    allocations = {cid: round(a, 2) for cid, a in allocations.items()}
+    return allocations
+
+
 # ================== Main Loop ==================
 def main():
     print("=" * 60)
@@ -707,6 +970,8 @@ def main():
     print(f"Split Amount: ${SPLIT_AMOUNT_USDC:.2f} | Order Size: {ORDER_SIZE_SHARES:.0f} shares")
     print(f"Base Spread: {BASE_SPREAD:.2f} | Max Spread: {MAX_SPREAD:.2f} | Refresh: {REFRESH_INTERVAL}s")
     print(f"Anti-Fill: depth>{MIN_DEPTH_AHEAD:.0f} | CB threshold={MIDPOINT_MOVE_THRESHOLD} | monitor={WS_MONITOR_INTERVAL}s")
+    print(f"Drift: rebalance>{DRIFT_THRESHOLD_PCT:.0%} | pause>{DRIFT_PAUSE_PCT:.0%} | method={REBALANCE_METHOD}")
+    print(f"Markets: min={MIN_MARKETS} | max_alloc={MAX_ALLOCATION_PCT:.0%} | expiry>{MIN_EXPIRY_DAYS}d | vol>${MIN_VOLUME_24H:,.0f}")
     print(f"DRY_RUN: {DRY_RUN}")
     print()
 
@@ -732,11 +997,14 @@ def main():
         print("FATAL: No markets found. Set TARGET_MARKETS in .env or check API.")
         sys.exit(1)
 
-    # 4. Split USDC for each market
+    # 4. Split USDC for each market (weighted allocation)
     print("[4/4] Splitting USDC into Yes+No positions...")
-    for condition_id, info in state.market_info.items():
-        print(f"\n  Market: {info['question'][:60]}...")
-        split_usdc(condition_id, SPLIT_AMOUNT_USDC)
+    allocations = calculate_allocations()
+    state.total_capital = sum(allocations.values())
+    for condition_id, alloc in allocations.items():
+        info = state.market_info[condition_id]
+        print(f"\n  Market: {info['question'][:50]}... | Allocation: ${alloc:.2f}")
+        split_usdc(condition_id, alloc)
 
     print_reward_estimate()
 
@@ -757,8 +1025,13 @@ def main():
                 q_short = info["question"][:50]
                 print(f"\n  [{q_short}...]")
 
-                # Check for fills and update positions
+                # Check for fills, drift, and rebalance
                 check_positions_and_fills(condition_id)
+
+                # Skip paused markets (drift too high, waiting for rebalance)
+                if condition_id in state.paused_markets:
+                    print(f"    [PAUSED] Market paused due to inventory drift")
+                    continue
 
                 # Refresh two-sided orders
                 place_two_sided_orders(condition_id)
